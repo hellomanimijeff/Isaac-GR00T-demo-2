@@ -112,6 +112,19 @@ def warn_configs(config: Config):
             "use_albumentations_transforms must be True when shortest_image_edge and crop_fraction are set"
         )
 
+    # RL config validation
+    if config.training.add_rl_callback:
+        if not config.training.rl_env_name:
+            raise ValueError(
+                "config.training.rl_env_name must be set when add_rl_callback=True.\n"
+                "Example: 'libero_sim/pick_up_the_black_bowl_from_table_center_and_place_it_on_the_plate'"
+            )
+        if config.training.rl_task_type not in ("manipulation", "locomotion"):
+            raise ValueError(
+                f"config.training.rl_task_type must be 'manipulation' or 'locomotion', "
+                f"got '{config.training.rl_task_type}'"
+            )
+
 
 def run(config: Config):
     warn_configs(config)
@@ -272,6 +285,52 @@ def run(config: Config):
             initial_actions_path = save_cfg_dir / INITIAL_ACTIONS_FILENAME
             save_initial_actions(initial_actions, initial_actions_path)
             logging.info(f"Saved {len(initial_actions)} initial actions to {initial_actions_path}")
+
+    # ------------------------------------------------------------------
+    # RL reward-informed training callback
+    # ------------------------------------------------------------------
+    if config.training.add_rl_callback:
+        from gr00t.experiment.rl_callback import RLCallback, ReplayBuffer
+
+        # Identify the active embodiment tag from the first dataset
+        embodiment_tag_str = config.data.datasets[0].embodiment_tag
+        if embodiment_tag_str not in config.data.modality_configs:
+            raise ValueError(
+                f"Embodiment tag '{embodiment_tag_str}' not found in modality_configs. "
+                f"Available: {list(config.data.modality_configs.keys())}"
+            )
+
+        # Shared buffer: RLCallback writes rewards, Gr00tTrainer reads mean_reward()
+        replay_buffer = ReplayBuffer(max_size=5000)
+        trainer.replay_buffer = replay_buffer
+        trainer.rl_weight = config.training.rl_weight
+
+        rl_callback = RLCallback(
+            env_name=config.training.rl_env_name,
+            modality_configs=config.data.modality_configs[embodiment_tag_str],
+            processor=processor,
+            replay_buffer=replay_buffer,
+            task_type=config.training.rl_task_type,
+            object_name=config.training.rl_object_name,
+            rollout_interval=config.training.rl_rollout_interval,
+            n_rollout_episodes=config.training.rl_n_rollout_episodes,
+            # action_horizon: take from modality config so it's always consistent
+            action_horizon=len(
+                config.data.modality_configs[embodiment_tag_str]["action"].delta_indices
+            ),
+            embodiment_tag=embodiment_tag_str,
+        )
+        trainer.add_callback(rl_callback)
+
+        logging.info(
+            "RL callback registered — env=%s  task=%s  object=%s  "
+            "rollout_every=%d steps  rl_weight=%.3f",
+            config.training.rl_env_name,
+            config.training.rl_task_type,
+            config.training.rl_object_name,
+            config.training.rl_rollout_interval,
+            config.training.rl_weight,
+        )
 
     # Train
     logging.info("🚀 Starting training...")

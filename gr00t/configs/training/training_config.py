@@ -110,8 +110,72 @@ class TrainingConfig:
     # For testing.
     assert_loss_less_than: float | None = None
 
-    # RL
+    # -----------------------------------------------------------------------
+    # RL reward-informed training
+    # -----------------------------------------------------------------------
+
     add_rl_callback: bool = False
+    """Enable reward-informed loss scaling via sim rollouts.
+
+    When True, RLCallback runs `rl_n_rollout_episodes` episodes every
+    `rl_rollout_interval` training steps, computes shaped rewards, and
+    uses the running-mean reward to modulate the imitation loss weight
+    (see Gr00tTrainer.compute_loss in trainer.py).
+
+    Requires a valid `rl_env_name` and a registered sim environment.
+    """
+
+    rl_env_name: str = ""
+    """Gymnasium environment id for rollouts.
+
+    Examples:
+        ``"libero_sim/pick_up_the_black_bowl_from_table_center_and_place_it_on_the_plate"``
+        ``"simpler_env_google/google_robot_pick_object"``
+
+    Must be non-empty when add_rl_callback=True.
+    """
+
+    rl_task_type: str = "manipulation"
+    """Reward function family.  Either ``"manipulation"`` or ``"locomotion"``.
+
+    - ``"manipulation"``  →  combined_manipulation_reward() (palm proximity + grasp + success)
+    - ``"locomotion"``    →  foot_placement_reward() (stable stride width)
+    """
+
+    rl_object_name: str = "apple"
+    """MuJoCo body name of the target object for manipulation reward.
+
+    Used by ``_get_object_pos`` in RLCallback to read the object's xyz
+    from the simulator.  Adjust to match the body name in your task's
+    BDDL / XML (e.g. ``"cube_main"``, ``"bowl_1"``).
+    """
+
+    rl_rollout_interval: int = 100
+    """Run sim rollouts every N training steps.
+
+    Lower values give faster reward feedback but slow down training.
+    Recommended range: 50–500 depending on episode length and GPU budget.
+    """
+
+    rl_n_rollout_episodes: int = 4
+    """Number of rollout episodes collected per rollout call.
+
+    More episodes → lower variance reward estimate, higher wall-clock cost.
+    """
+
+    rl_weight: float = 0.05
+    """Strength of the reward signal on the imitation loss.
+
+    The imitation loss is scaled by ``(1 + rl_weight * (1 - reward_ema))``:
+    - When reward_ema ≈ 0 (poor policy): loss × (1 + rl_weight)  → train harder
+    - When reward_ema ≈ 1 (good policy): loss × 1.0              → normal training
+
+    Keep small (0.01–0.10) to avoid destabilising the imitation baseline.
+    """
+
+    # -----------------------------------------------------------------------
+    # Open-loop evaluation
+    # -----------------------------------------------------------------------
 
     # Open-loop evaluation
     enable_open_loop_eval: bool = False

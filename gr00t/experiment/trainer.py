@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Custom Trainer with simple profiling utilities.
+"""Custom Trainer with simple profiling utilities and reward-informed loss scaling.
 
 This subclass of HuggingFace's ``Trainer`` measures:
 1. Data loading latency (time between the end of the previous ``training_step`` and
@@ -25,6 +25,23 @@ The statistics are logged via ``self.log`` every ``profile_log_interval`` steps 
 also sent to the standard ``logging`` logger.  This is *not* meant to be a fully
 fledged profiler – it is a quick, lightweight way to confirm whether the training
 pipeline is bottlenecked by data loading or by the model's computation.
+
+RL reward-informed loss scaling
+--------------------------------
+When ``trainer.replay_buffer`` is set (by experiment.py when add_rl_callback=True),
+``compute_loss`` reads the running-mean reward from the buffer and applies a small
+multiplicative adjustment to the imitation loss:
+
+    adjusted_loss = loss * (1 + rl_weight * (1 - reward_ema))
+
+- reward_ema ≈ 0 (policy performing poorly in sim): loss scaled up by (1 + rl_weight)
+  → gradient updates are slightly more aggressive.
+- reward_ema ≈ 1 (policy performing well): scaling factor → 1.0 → normal training.
+
+This is NOT full policy-gradient RL.  It is reward-informed loss scaling that
+provides gentle feedback from the sim environment into the imitation training loop.
+The architecture is designed so that proper REINFORCE / PPO can be layered on top
+later without restructuring the codebase.
 """
 
 from __future__ import annotations
@@ -35,6 +52,7 @@ import queue
 import threading
 from typing import Any, Optional
 
+import numpy as np
 import torch
 from transformers.trainer import TRAINER_STATE_NAME, Trainer, TrainerState, get_last_checkpoint
 from transformers.trainer_callback import TrainerCallback
@@ -211,6 +229,15 @@ class Gr00tTrainer(Trainer):
             # compute_metrics=partial(compute_eval_accuracy, action_offset=self.action_offset),
         )
 
+        # ------------------------------------------------------------------
+        # RL reward-informed loss scaling
+        # Set externally by experiment.py when config.training.add_rl_callback=True
+        # ------------------------------------------------------------------
+        self.replay_buffer = None        # gr00t.experiment.rl_callback.ReplayBuffer | None
+        self.rl_weight: float = 0.05     # scaling strength; overridden from TrainingConfig
+        self._rl_reward_ema: float = 0.0 # exponential moving average of recent sim rewards
+        self._rl_ema_alpha: float = 0.1  # EMA smoothing factor (higher = faster adaptation)
+
     def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
         # Hide epoch from logged metrics as it's misleading for Iterable datasets.
         epoch = self.state.epoch
@@ -298,6 +325,18 @@ class Gr00tTrainer(Trainer):
         functions, etc.) to the parent ``Trainer.compute_loss`` implementation
         by calling it with ``return_outputs=True``.  After obtaining the loss
         *and* model outputs, we calculate accuracy and push it to the logger.
+
+        RL reward-informed loss scaling
+        --------------------------------
+        If a ReplayBuffer has been attached (trainer.replay_buffer is not None
+        and has at least 10 reward samples), the imitation loss is multiplied by:
+
+            (1 + rl_weight * (1 - reward_ema))
+
+        - reward_ema ≈ 0  → scale factor = (1 + rl_weight)  → train more aggressively
+        - reward_ema ≈ 1  → scale factor = 1.0              → normal imitation training
+
+        The EMA is updated with a smoothing factor of _rl_ema_alpha (default 0.1).
         """
 
         # Use parent implementation to preserve built-in functionality.
@@ -307,19 +346,44 @@ class Gr00tTrainer(Trainer):
             return_outputs=True,
             num_items_in_batch=num_items_in_batch,
         )
-        # import ipdb; ipdb.set_trace()
-        # # save the model's embedding for the first step
-        # input_embeddings = model.get_input_embeddings().weight.data.cpu()
-        # output_embeddings = model.get_output_embeddings().weight.data.cpu()
-        # torch.save(input_embeddings, f"input_embeddings_{self.state.global_step}.pt")
-        # torch.save(output_embeddings, f"output_embeddings_{self.state.global_step}.pt")
 
         # Record last loss for testing purposes.
         self.loss = loss
 
-        # --------------------------------------------------------------
-        # Accuracy calculation
-        # --------------------------------------------------------------
+        # ------------------------------------------------------------------
+        # RL reward-informed loss scaling
+        # ------------------------------------------------------------------
+        if self.replay_buffer is not None and len(self.replay_buffer) >= 10:
+            mean_reward = self.replay_buffer.mean_reward()
+
+            # Update exponential moving average
+            self._rl_reward_ema = (
+                self._rl_ema_alpha * mean_reward
+                + (1.0 - self._rl_ema_alpha) * self._rl_reward_ema
+            )
+
+            # Scale imitation loss based on reward EMA.
+            # When the policy performs poorly (reward_ema → 0), scale up to
+            # push harder.  When performing well (reward_ema → 1), return to
+            # normal.  Clip to [0, 1] so the scaling is always positive.
+            reward_norm = float(np.clip(self._rl_reward_ema, 0.0, 1.0))
+            rl_adjustment = self.rl_weight * (1.0 - reward_norm)
+            loss = loss * (1.0 + rl_adjustment)
+
+            # Log RL metrics at normal logging cadence, rank-0 only
+            if (
+                self.state.global_step % self.args.logging_steps == 0
+                and self.args.local_rank in (-1, 0)
+            ):
+                self.log({
+                    "rl/reward_ema":    float(self._rl_reward_ema),
+                    "rl/loss_scale":    float(1.0 + rl_adjustment),
+                    "rl/buffer_size":   float(len(self.replay_buffer)),
+                })
+
+        # ------------------------------------------------------------------
+        # Accuracy calculation (unchanged from original)
+        # ------------------------------------------------------------------
         if (
             self.state.global_step % self.args.logging_steps == 0
             and model.training
